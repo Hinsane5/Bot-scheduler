@@ -1,0 +1,8 @@
+discord.py>=2.3
+playwright>=1.40
+httpx>=0.26
+beautifulsoup4>=4.12
+apscheduler>=3.10
+python-dotenv>=1.0
+tzdata>=2024.1
+
