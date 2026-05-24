@@ -33,106 +33,134 @@ Total estimated effort: ~35–45 hours over 3 weeks of evenings.
 
 ---
 
-## Phase 1 — Reconnaissance (mostly DONE, finishing up)
+## Phase 1 — Reconnaissance (DONE for core scope)
 
 **Status from May 2026 recon:**
 
-✅ **LMS schedule endpoint — CONFIRMED:**
+✅ **LMS endpoint — CONFIRMED** (see [LMS_Requirement.md](LMS_Requirement.md)):
 - `POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Date-v1/YYYY-M-D`
-- Auth: `Authorization: Bearer <JWT>` (24h lifetime, BinusServices issuer)
+- Auth: `Authorization: Bearer <JWT>` (~24 h lifetime, BinusServices issuer)
 - Custom headers: `rOId`, `academicCareer`, `institution`, `roleName`, `roleId`
-- POST body: `{"roleActivity": [...]}` with user-specific role context
+- POST body: `{"roleActivity": [...]}` with user role context
+- **Single endpoint** returns BOTH `class` and `assignment_deadline` items (discriminated by `scheduleType == "Assignment"` or `lamType == "ASG"`)
+- 204 No Content = no events that day
+- Login flow: Microsoft SSO → binusmaya → manual nav to LMS dashboard
 - Sample saved to `data/sample_response_lms_schedule.json`
 
-✅ **Auth flow — CONFIRMED:**
-- Login → Microsoft SSO → `binusmaya.binus.ac.id` → manually nav to `lms.binus.ac.id/lms/dashboard` → frontend issues JWT to `func-bm7-*`.
-- localStorage `persist:lms` is CryptoJS-encrypted (we bypass by capturing token from network instead of decrypting).
+✅ **Messier endpoint — CONFIRMED** (see [MESSIER_Requirement.md](MESSIER_Requirement.md)):
+- `POST https://socs1.binus.ac.id/messier/Job.svc/GetActivesJob`
+- Auth: cookie session (`.ASPXAUTH`), NOT bearer token
+- Body: `{"type": "future"}`
+- **Single endpoint** returns BOTH `teaching` and `correction_deadline` items (discriminated by `JobType`: `Teaching` / `Exam Proctor` / `Marking`)
+- Quirks: ASP.NET `/Date(ms+tz)/` format, all-zero `Id`, inconsistent `Status` strings, year-9999 sentinel for Marking `LatestDate`
+- Login flow: classic ASP.NET form login (`Login.aspx` → `Home.aspx`)
 
-✅ **Refresh strategy — DESIGNED:**
-- SSO cookies (Microsoft + Binusmaya) live 30–90 days.
-- Headless Playwright `refresh_job` loads cookies, navigates, captures new JWT.
+✅ **Dual auth strategy — DESIGNED:**
+- LMS = bearer JWT, refreshable via Microsoft SSO cookies every 20 h
+- Messier = `.ASPXAUTH` cookie, refreshable via sliding-expiry ping every ~25 min
 
-❌ **Still TBD:**
-- **LMS assignment endpoint** — probably a different `func-bm7-*-prod.azurewebsites.net` subdomain. Find by navigating to assignment/to-do page in DevTools.
-- **Messier teaching endpoint** — capture XHR on `socs1.binus.ac.id/messier/`.
-- **Messier correction endpoint** — same drill on a correction-deadline page.
-- **Messier auth:** does it share the LMS JWT, or issue its own?
-- **(Optional) Outlook calendar** — does `outlook.office.com/calendar` auto-receive Binus schedule? If yes, Microsoft Graph is a cleaner option.
+⏳ **Nice-to-have, not blocking:**
+- **`.ASPXAUTH` absolute lifetime** — measure to confirm `MESSIER_REFRESH_INTERVAL_MIN=25` is safe.
+- **Online-class meeting link** — LMS captured sample is F2F-only; capture one online class to see where the link field lives.
+- **Assignment detail URL** — so reminder DMs can deep-link.
+- **(Optional) Outlook calendar check** — could simplify project via Microsoft Graph (deferred).
 
-**Tasks:**
-1. Navigate LMS → assignments/to-do page. DevTools → Network → capture an assignment XHR. Save to `data/sample_response_lms_assignments.json`. Note URL, headers, body.
-2. Log in to Messier. Capture teaching schedule + correction-deadline XHRs. Save samples. Note whether the bearer token matches the LMS one.
-3. (Optional, 2 min) Check Outlook calendar.
-4. Update `RECON.md` with all findings.
+**Acceptance:** `docs/LMS_Requirement.md` + `docs/MESSIER_Requirement.md` both exist with confirmed endpoints, field mappings, and quirks documented.
 
-**Acceptance:** `RECON.md` answers all open questions. All sample payloads captured.
-
-**Gotchas:** Capture as cURL via DevTools (right-click XHR → Copy → Copy as cURL) — preserves all headers.
+**Gotchas:** capture as cURL via DevTools (right-click XHR → Copy → Copy as cURL) — preserves all headers.
 
 ---
 
-## Phase 2 — Auth with token capture + refresh (4–6 hours)
+## Phase 2 — Dual-auth: token capture + cookie session + refresh (5–7 hours)
 
-**Goal:** `auth.py` that captures the bearer JWT, SSO cookies, custom headers, and POST body on first login. Includes a headless refresh path that silently re-mints the JWT using saved SSO cookies.
+**Goal:** A single `auth.py` that handles BOTH auth styles:
+- **LMS** — capture bearer JWT (+ SSO cookies + custom headers + POST body), refresh via SSO cookies every 20 h.
+- **Messier** — capture `.ASPXAUTH` cookie (via `storage_state`), refresh via `Home.aspx` sliding bump every ~25 min.
+
+The interface is portal-agnostic; internal dispatch on `auth_mode` (`"bearer"` vs `"cookie"`).
 
 **Tasks:**
 
-### `interactive_login(portal)`
-1. Headed Playwright (`headless=False`).
-2. `page.on("request", ...)` listener that filters requests to the portal's API base (e.g. `func-bm7-*.azurewebsites.net`). On match, capture:
-   - `Authorization` header
-   - All custom headers (`rOId`, `roleId`, `academicCareer`, `institution`, `roleName`)
-   - `request.post_data` (the `roleActivity` JSON)
-3. `page.goto(LMS_DASHBOARD_URL)`. SSO redirects user to login.
-4. Wait for the user to log in (`input("Press Enter once dashboard is fully loaded...")` OR `page.wait_for_url(LMS_DASHBOARD_URL)`).
-5. If page lands on `binusmaya.binus.ac.id` after login, `page.goto(LMS_DASHBOARD_URL)` to force the LMS to load.
-6. Wait until the listener has captured a request to the API (with timeout).
-7. Decode JWT to extract `exp` for `token_exp`.
-8. Write `auth_state_<portal>.json` with:
-   ```json
-   {
-     "storage_state": page.context.storage_state(),
-     "bearer_token": "...",
-     "token_exp": "...",
-     "headers": {...},
-     "post_body": {...},
-     "captured_at": "...",
-     "last_refresh_at": "..."
-   }
-   ```
-9. `chmod 600` on the file.
-
-### `refresh_token(portal) -> bool`
-1. Headless Playwright (`headless=True`) with `storage_state` from saved file.
-2. Same listener pattern as above.
-3. `page.goto(LMS_DASHBOARD_URL)`. If frontend tries to redirect to login → SSO cookies dead → return False.
-4. On captured XHR → extract fresh bearer + headers → update the JSON file → return True.
-
-### `is_token_valid(portal, safety_margin_min=30) -> bool`
-- Parses `token_exp`, returns True if expiry is at least `safety_margin_min` minutes in the future.
-
-### `load_creds(portal) -> dict`
-- Reads + returns the JSON file.
-
-### CLI
+### Portal config (in `src/auth.py`)
 ```python
-# python -m src.auth --portal=lms             # interactive
-# python -m src.auth --portal=lms --refresh   # test headless refresh
-# python -m src.auth --portal=lms --check     # validity probe
+PORTALS = {
+    "lms": {
+        "mode": "bearer",
+        "entry_url": "https://lms.binus.ac.id/lms/dashboard",
+        # After login, navigate here to FORCE the schedule API to fire.
+        # Templated with current year-month at call time.
+        "schedule_url_template": "https://lms.binus.ac.id/lms/schedule/{year}-{month}",
+        "api_url_pattern": re.compile(r"func-bm7-.*\.azurewebsites\.net/api/"),
+        "header_keys": ["Authorization", "rOId", "academicCareer", "institution", "roleName", "roleId"],
+        "login_url_marker": "login.microsoftonline.com",  # refresh failed → bounced to MS login
+    },
+    "messier": {
+        "mode": "cookie",
+        # Home.aspx, NOT Login.aspx — Login.aspx triggers a broken ASP.NET
+        # cookie-detection redirect that 404s at root /Login.aspx.
+        # Home.aspx unauthenticated triggers the app's own (working) login redirect.
+        "entry_url": "https://socs1.binus.ac.id/messier/Home.aspx",
+        "refresh_url": "https://socs1.binus.ac.id/messier/Home.aspx",
+        "login_url_marker": "Login.aspx",
+        # Pre-set the ASP.NET cookie-support test cookie so the server
+        # skips its broken detection redirect entirely.
+        "preset_cookies": [
+            {"name": "AspxAutoDetectCookieSupport", "value": "1",
+             "domain": "socs1.binus.ac.id", "path": "/"},
+        ],
+    },
+}
 ```
 
-**Deliverable:** Run `python -m src.auth --portal=lms` → log in → `auth_state_lms.json` written. Then `python -m src.auth --portal=lms --refresh` → no UI, no prompts → new token captured silently.
+### `interactive_login(portal)` (headed)
+1. Headed Playwright with a **fresh context** (no saved `storage_state` — stale cookies cause weird redirects, especially on Messier).
+2. Apply `preset_cookies` if configured (Messier needs the ASPX cookie pre-set).
+3. For `bearer` mode: install `page.on("request", ...)` listener filtering to `api_url_pattern`, capturing `header_keys` + `request.post_data`. Keep the LATEST match.
+4. Open `entry_url`. Print "Press Enter when you've finished logging in" and `await asyncio.to_thread(input)`. Don't rely on URL polling — user knows best when login completes.
+5. For `bearer` mode: navigate to the **schedule page** (`schedule_url_template` rendered with current year-month) — this is what fires the bearer API call. The dashboard alone often doesn't.
+6. Wait up to 60s for the listener to capture a matching request.
+7. Save `auth_state_<portal>.json`:
+   - **bearer:** `{auth_mode, storage_state, bearer_token, token_exp, headers, post_body, captured_at, last_refresh_at}`
+   - **cookie:** `{auth_mode, storage_state, captured_at, last_refresh_at}`
+8. `chmod 600` on the file.
+
+### `refresh(portal) -> bool` (headless)
+- **bearer:** headless Playwright with saved `storage_state` + preset_cookies → listener installed → `page.goto(entry_url)` → if URL contains `login_url_marker` (e.g. `login.microsoftonline.com`), SSO cookies are dead → return False. Otherwise `page.goto(schedule_url)` to force the API call → capture fresh bearer + headers → update JSON → return True.
+- **cookie:** headless Playwright with saved `storage_state` + preset_cookies → `page.goto(refresh_url)` → if final URL contains `login_url_marker` (`Login.aspx`) → False; else → save new `storage_state` → True.
+
+### `load_creds(portal) -> dict`
+Reads + returns the JSON file.
+
+### `is_session_valid(portal) -> bool`
+- **bearer:** JWT `exp` is at least 30 min in the future.
+- **cookie:** `last_refresh_at` is within `MESSIER_REFRESH_INTERVAL_MIN`.
+
+### CLI
+```
+python -m src.auth --portal=lms                # interactive login
+python -m src.auth --portal=messier            # interactive login
+python -m src.auth --portal=lms --refresh      # test headless refresh
+python -m src.auth --portal=messier --refresh
+python -m src.auth --portal=lms --check        # validity probe
+python -m src.auth --portal=messier --check
+```
+
+**Deliverable:**
+- `python -m src.auth --portal=lms` → log in → `auth_state_lms.json` written with `auth_mode: "bearer"` and all fields populated.
+- `python -m src.auth --portal=messier` → log in → `auth_state_messier.json` written with `auth_mode: "cookie"`.
+- `--refresh` succeeds for both without manual intervention.
 
 **Acceptance:**
-- After interactive login, file contains all required fields.
-- `--refresh` succeeds without manual intervention, with `token_exp` advanced ~24h.
-- `--check` returns `valid` immediately after login or refresh.
-- File is `chmod 600`, gitignored.
+- Both files exist, `chmod 600`, gitignored.
+- Both `--check` return `valid` after their respective `--refresh`.
+- LMS refresh advances `token_exp` ~24 h forward.
+- Messier refresh advances `last_refresh_at` to "now."
 
 **Gotchas:**
-- The token capture listener can fire on multiple XHRs — keep the LATEST captured headers (frontend may issue several calls during dashboard load).
-- Microsoft SSO can show a "stay signed in?" prompt — answer Yes once during interactive login so SSO cookies persist.
-- Some `func-bm7-*` calls may not include the custom headers (e.g. asset/static endpoints). Filter for ones whose URL contains `/api/`.
+- LMS listener may fire on multiple XHRs — keep the LATEST captured. Filter to URLs containing `/api/` to skip static assets.
+- Microsoft SSO can show a "stay signed in?" prompt — answer Yes once so SSO cookies persist.
+- Messier `Home.aspx` may render slowly; use `page.wait_for_load_state("networkidle")` before re-saving state.
+- If Messier login form is wrapped by Next.js (per the `__Host-next-auth.csrf-token` cookie observed), expect the login URL to redirect — just rely on `wait_for_url` reaching `Home.aspx`.
 
 ---
 
@@ -144,15 +172,21 @@ Total estimated effort: ~35–45 hours over 3 weeks of evenings.
 1. `src/parser.py` — `Event` dataclass + `EventType`, `EventSource` literals.
 2. `src/scrapers/base.py` — `Scraper` ABC: `async fetch(start: date, end: date) -> list[Event]`.
 3. `src/scrapers/lms.py` — `LMSScraper`:
-   - In `fetch`, load creds via `auth.load_creds("lms")`.
-   - If `not is_token_valid("lms")` → `await auth.refresh_token("lms")`.
-   - For each date in range:
-     - `httpx.AsyncClient` POST to `LMS_API_BASE/api/Schedule/Date-v1/{date}` with bearer + custom headers + POST body.
-     - If 401: try one refresh; retry; if still 401 → raise `SessionExpired`.
-   - Parse JSON → `list[Event]` (only `class` for now; `assignment_deadline` added once recon completes).
-   - Sort by start time.
+   - Class constants: `MONTH_API`, `DATE_API`, `DASHBOARD_URL` (see ARCHITECTURE.md).
+   - In `fetch(start, end)`:
+     - Load creds via `auth.load_creds("lms")`. If `not is_session_valid("lms")` → `await auth.refresh("lms")`.
+     - Compute distinct months in `[start, end]` (typically 1–2 months).
+     - For each month, `httpx.AsyncClient` POST to `MONTH_API/{YYYY-M-1}` with bearer + custom headers + saved `post_body`.
+     - On 401: try one `auth.refresh("lms")`; retry. Still 401 → raise `SessionExpired`.
+   - Parse: response is `[{dateStart, Schedule: [...]}, ...]`. Flatten all `Schedule` arrays.
+   - Map each item by `scheduleType`:
+     - `"Assignment"` (or `lamType == "ASG"`) → `assignment_deadline` (`start = customParam.dueDate`, `end = null`).
+     - `"Onsite"`, `"Online"`, `"Virtual Class"` → `class` (`start = dateStart`, `end = dateEnd`, `location = location` if set).
+     - `"Event"` → `other` (`start = dateStart`, `end = dateEnd`, `link = customParam.url`).
+     - Unknown → log warning + `type = "other"`.
+   - Filter to the requested date range. Sort by start time.
 4. `src/scrapers/__init__.py` — `REGISTRY = {"lms": LMSScraper()}`.
-5. CLI: `python -m src.scrapers.lms` — fetches today + next 7 days, pretty-prints.
+5. CLI: `python -m src.scrapers.lms` — fetches today + next 30 days, pretty-prints.
 
 **Deliverable:** CLI prints a real list of your classes for the next week.
 
@@ -163,8 +197,10 @@ Total estimated effort: ~35–45 hours over 3 weeks of evenings.
 
 **Gotchas:**
 - Always `datetime.now(ZoneInfo("Asia/Jakarta"))`. Never naïve `datetime.now()`.
-- ID: `sha1(f"{source}|{title}|{start.isoformat()}".encode()).hexdigest()[:12]`.
-- The endpoint expects URL format `YYYY-M-D` (no zero padding observed in your curl — `2026-5-10`, not `2026-05-10`). Verify with sample.
+- ID: `sha1(f"{source}|{title}|{start.isoformat()}".encode()).hexdigest()[:12]`. Use LMS `scheduleId` in `notes` for traceability.
+- URL format is `YYYY-M-D` without zero padding (`2026-5-10`, not `2026-05-10`). Use `f"{d.year}-{d.month}-{d.day}"`, not `d.strftime("%Y-%m-%d")`.
+- Month-v1 takes the **first day of the month** in the URL (`2026-5-1`), not an arbitrary date. Always normalize: `month_start = date(d.year, d.month, 1)`.
+- Days with no events are omitted from the Month-v1 response — don't expect placeholder empty days.
 
 ---
 
@@ -213,8 +249,10 @@ Total estimated effort: ~35–45 hours over 3 weeks of evenings.
    - For each `name in ENABLED_SCRAPERS`, own try/except.
    - `await REGISTRY[name].fetch(today, today+30d)` → upsert → log.
    - On `SessionExpired` → DM "re-auth `python -m src.auth --portal=<name>`".
-3. `refresh_job` every `REFRESH_INTERVAL_HOURS` (20):
-   - For each portal, `await auth.refresh_token(portal)`. Log to `refresh_log`. If False → DM user.
+3. Two separate refresh jobs (different cadences):
+   - `refresh_job_lms` every `LMS_REFRESH_INTERVAL_HOURS` (20): `await auth.refresh("lms")`. If False → DM user "Run `python -m src.auth --portal=lms`."
+   - `refresh_job_messier` every `MESSIER_REFRESH_INTERVAL_MIN` (25): `await auth.refresh("messier")`. If False → DM user.
+   - Both log to `refresh_log`.
 4. `backup_job` daily at `BACKUP_HOUR_LOCAL`:
    - `db.backup_to(f"data/backup/events_{today}.db")`.
    - Delete backups older than 7 days.
@@ -288,16 +326,62 @@ Total estimated effort: ~35–45 hours over 3 weeks of evenings.
 
 ## Phase 10 — Add Messier scraper (3–5 hours)
 
-**Goal:** Teaching + correction-deadline events flow in alongside LMS.
+**Goal:** `teaching` + `correction_deadline` events flow in alongside LMS via the cookie-auth path.
+
+**Prereq:** Phase 2 already extended `auth.py` to support cookie mode. `python -m src.auth --portal=messier` works and `auth_state_messier.json` exists.
 
 **Tasks:**
-1. If Messier shares LMS JWT → `MessierScraper` reuses `auth.load_creds("lms")`.
-2. If Messier issues its own JWT → run separate `interactive_login("messier")` + `refresh_token("messier")` paths.
-3. `src/scrapers/messier.py` with `MessierScraper.fetch`.
-4. Add to `REGISTRY`. Update `.env` `ENABLED_SCRAPERS=lms,messier` on local + VM.
-5. CLI test, restart bot, deploy to VM.
 
-**Acceptance:** `/today` shows merged LMS + Messier events. Each scraper independent. All 4 auto-types get correct reminders.
+### `src/scrapers/messier.py`
+1. Implement `MessierScraper(Scraper)` with class constants:
+   - `JOBS_API = "https://socs1.binus.ac.id/messier/Job.svc/GetActivesJob"`
+   - `HOME_URL = "https://socs1.binus.ac.id/messier/Home.aspx"`
+2. `async def fetch(self, start: date, end: date) -> list[Event]`:
+   - `creds = auth.load_creds("messier")`
+   - `cookies = {c["name"]: c["value"] for c in creds["storage_state"]["cookies"] if "binus.ac.id" in c["domain"]}`
+   - `httpx.AsyncClient(cookies=cookies)` → POST to `JOBS_API` with body `{"type": "future"}` and headers `{"X-Requested-With": "XMLHttpRequest", "Content-Type": "application/json; charset=utf-8", "Referer": HOME_URL, "Origin": "https://socs1.binus.ac.id"}`.
+   - If response has `Location` header pointing to `Login.aspx` (302) OR body content suggests login page → trigger `await auth.refresh("messier")`; retry once. Still failing → raise `SessionExpired`.
+   - Parse `response.json()["d"]` → `list[Event]`.
+
+### Parser logic (per [MESSIER_Requirement.md](MESSIER_Requirement.md))
+3. Implement `parse_aspnet_date(s)` helper.
+4. For each `job`:
+   - Skip if normalized `status == "done"`.
+   - `start = parse_aspnet_date(job["StartDate"])` (Teaching/Proctor) OR `parse_aspnet_date(job["EndDate"])` (Marking — deadline).
+   - Skip if `start < today` or `start > end_date`.
+   - Map `JobType`:
+     - `"Teaching"` / `"Exam Proctor"` → `type="teaching"`
+     - `"Marking"` → `type="correction_deadline"`
+     - Unknown → log warning, default `type="other"`
+   - Parse `Description` for course name, class code, room, session number.
+   - Build title per the format suggestions.
+   - `id = sha1(f"messier|{job['Note']}|{start.isoformat()}".encode()).hexdigest()[:12]`.
+   - `Event(source="messier", ...)`.
+
+### Register + deploy
+5. `src/scrapers/__init__.py`: `REGISTRY = {"lms": LMSScraper(), "messier": MessierScraper()}`.
+6. Confirm `.env ENABLED_SCRAPERS=lms,messier` on local + VM.
+7. Add `refresh_job_messier` (every `MESSIER_REFRESH_INTERVAL_MIN`) to `main.py`'s scheduler — separate from `refresh_job_lms` because frequencies differ.
+8. CLI test: `python -m src.scrapers.messier` prints today's teaching + corrections.
+9. Restart bot. `/status` should show two scrapers + two refresh jobs.
+10. `scp auth_state_messier.json` to VM (`chmod 600`), restart `bot-timetable` service.
+
+**Deliverable:** `/today` shows merged LMS + Messier events in chronological order. `/upcoming type:teaching` filters correctly.
+
+**Acceptance:**
+- Messier scraper runs every 15 min on its own schedule.
+- Breaking `auth_state_lms.json` does NOT stop Messier syncs (and vice versa).
+- All four auto-types (`class`, `teaching`, `assignment_deadline`, `correction_deadline`) receive correct reminders.
+- Done items (Status=Done) are excluded.
+- Unknown `JobType` logged as warning + saved as `type=other` (doesn't crash).
+- Substitute jobs are correctly detected from the `(Substitute)` prefix in `Description`.
+
+**Gotchas:**
+- ASP.NET date format: `re.compile(r"^/Date\((-?\d+)[+-]\d+\)/$")` — the `-?` matters for negative dates (year-9999 sentinel computes as positive but be defensive).
+- `Status` normalization: `s.strip().replace(" ", "").lower()` before comparing.
+- The `Id` field is ALL ZEROS — never use it; use the composite SHA1 from `Note` + `StartDate`.
+- Marking's `LatestDate` is `253370739600000` (year 9999) — IGNORE this; use `EndDate`.
+- If `MESSIER_REFRESH_INTERVAL_MIN=25` proves too long (random 302s during scrape), drop to 15 min.
 
 ---
 

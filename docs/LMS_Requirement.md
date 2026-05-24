@@ -13,25 +13,48 @@ Use Binus LMS as the source for student-side events:
 The scraper should convert LMS schedule items into the shared `Event` model used
 by the Discord bot.
 
-## Discovered Endpoint
+## Discovered Endpoints
 
-LMS schedule and assignment items appear to come from the same date-based
-schedule endpoint.
+Two equivalent endpoints — both return schedule + assignment items from the same data source.
+
+### Preferred: `Month-v1` (one call per month)
+
+```text
+POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Month-v1/{year}-{month}-{day}
+```
+
+Returns the entire month's schedule grouped by day. **Scraper uses this in production** — 1 call covers ~30 days vs 30 Date-v1 calls.
+
+Example:
+```text
+POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Month-v1/2026-5-1
+```
+
+Response (Month-v1) is an array of per-day buckets:
+```json
+[
+  {
+    "dateStart": "2026-05-02T09:20:00",     // wrapper date (first event of day)
+    "Schedule": [
+      { /* class item */ },
+      { /* assignment item */ },
+      ...
+    ]
+  },
+  { /* next day with events */ },
+  ...
+]
+```
+
+Days with no events are **omitted from the array** (not represented as empty buckets).
+
+### Fallback: `Date-v1` (one call per day)
 
 ```text
 POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Date-v1/{year}-{month}-{day}
 ```
 
-Example:
-
-```text
-POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Date-v1/2026-5-23
-POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Date-v1/2026-5-10
-```
-
-The endpoint appears to return schedule entries for one specific date. The
-scraper may need to call it once per day for the requested date range unless a
-range endpoint is discovered.
+Useful for debugging or fetching a single specific date. Not used in the production scraper loop. Returns `{dateStart, Schedule: []}` or `204 No Content` for empty days.
 
 ## Request Requirements
 
@@ -260,11 +283,24 @@ Example normalized event:
 
 ## Detection Rules
 
-Recommended classification:
+### `scheduleType` → `Event.type` mapping
 
-- If `scheduleType == "Assignment"` or `lamType == "ASG"`, create an
-  `assignment_deadline` event.
-- Otherwise, create a `class` event for normal schedule items.
+| `scheduleType`     | → `Event.type`         | Notes                                                              |
+|--------------------|------------------------|--------------------------------------------------------------------|
+| `Assignment`       | `assignment_deadline`  | Also matched by `lamType == "ASG"`. Use `customParam.dueDate`.    |
+| `Onsite`           | `class`                | F2F class with room in `location` / `locationValue`                |
+| `Online`           | `class`                | GSLC online class. `location` is null. No meeting link in payload  |
+| `Virtual Class`    | `class`                | Virtual lecture. `location` is null. No meeting link in payload    |
+| `Event`            | `other`                | Binus Festival / school event. **Meeting link in `customParam.url`** |
+| (unknown)          | `other`                | Log a warning. Fall back to `other` so the event still appears     |
+
+### Link extraction
+
+- For `Event`: `link = customParam.url` (Zoom/Teams URL — observed in Binus Festival items).
+- For `Online` / `Virtual Class` (GSLC): no link in the schedule payload. Likely lives behind a click-through to the class session page (TBD). For v1, `link = null`.
+- For `Onsite` / `class` and `Assignment`: `link = null`.
+
+### Other classification details
 
 Recommended assignment deadline time:
 
@@ -361,13 +397,11 @@ behavior confirmed:
 
 ### Date Range Behavior
 
-Confirm whether LMS has a weekly/monthly/range endpoint. If not, the scraper
-will call `/Date-v1/{year}-{month}-{day}` once per day.
+✅ **Resolved.** `Month-v1` returns the entire month in one call. Production scraper iterates over months overlapping the requested range, then client-side filters to the actual dates. Typically 1–2 API calls cover a 30-day window.
 
 ### Online Class Sample
 
-Current class samples are face-to-face. Capture one online or hybrid class item
-to see where LMS stores the meeting link.
+✅ **Partially resolved.** `Online` and `Virtual Class` scheduleTypes captured. **Confirmed:** the schedule payload does NOT include a meeting link for GSLC/Online classes. Only `scheduleType == "Event"` items expose a link (via `customParam.url`). To get the join link for a regular Online class, the user has to click through to the class session — likely a separate API endpoint. For v1, `link = null` for Online classes is acceptable.
 
 ### Assignment Detail Link
 

@@ -21,13 +21,45 @@ If any of these conflict with this file, **the doc wins** — update this file t
 
 ## Confirmed facts (Phase 1 recon, May 2026)
 
-- **LMS schedule endpoint:** `POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Date-v1/YYYY-M-D`
-- **Auth:** `Authorization: Bearer <JWT>` (24h lifetime). NOT cookies for the API itself. Cookies are only used for refresh.
-- **Required custom headers:** `rOId`, `academicCareer`, `institution`, `roleName`, `roleId`.
-- **POST body:** `{"roleActivity": [...]}` with user-specific role context.
-- **Login flow:** lms.binus.ac.id → Microsoft SSO → binusmaya.binus.ac.id → manually nav to lms.binus.ac.id/lms/dashboard → frontend mints JWT.
-- **localStorage `persist:lms`** is CryptoJS-encrypted — we **do not** try to decrypt. We capture the JWT from network instead.
-- **Refresh strategy:** SSO cookies (~30–90d) outlive JWT (24h) → headless Playwright re-mints JWT every 20h.
+### LMS — bearer JWT auth (full spec: `docs/LMS_Requirement.md`)
+- **Preferred endpoint:** `POST https://func-bm7-schedule-prod.azurewebsites.net/api/Schedule/Month-v1/YYYY-M-1` (one call per month — production scraper uses this).
+- **Fallback endpoint:** `Date-v1/YYYY-M-D` (one call per day — debug only).
+- **Auth:** `Authorization: Bearer <JWT>` (~24 h lifetime). NOT cookies for the API itself. Cookies are only used to refresh the JWT.
+- **Required custom headers:** `rOId`, `academicCareer`, `institution`, `roleName`, `roleId`. `rOId` must match the `roleOrganizationId` of whichever `roleActivity` item has `isActive: true` in the POST body.
+- **POST body:** `{"roleActivity": [...]}` with user-specific role context (preserved from interactive login — don't try to switch roles).
+- **Single endpoint returns ALL event types** — discriminate by `scheduleType`:
+  - `"Onsite"` / `"Online"` / `"Virtual Class"` → `class`
+  - `"Assignment"` (or `lamType == "ASG"`) → `assignment_deadline` (`start = customParam.dueDate`)
+  - `"Event"` → `other` (`link = customParam.url` — Zoom URL exposed for Events)
+  - Unknown → log warning, fall back to `other`
+- **URL format:** `YYYY-M-D` WITHOUT zero padding (`2026-5-1`, not `2026-05-01`).
+- Month-v1 takes the **first of the month** (`2026-5-1`), not arbitrary dates.
+- Month-v1 response: array of `{dateStart, Schedule[]}` buckets; days with no events are OMITTED.
+- Date-v1 returns `204 No Content` for empty days.
+- **Login flow:** `lms.binus.ac.id` → Microsoft SSO → `binusmaya.binus.ac.id` → manual nav to `lms.binus.ac.id/lms/dashboard` → frontend mints JWT.
+- **localStorage `persist:lms`** is CryptoJS-encrypted — we do NOT decrypt. We capture the JWT from network instead.
+- **Refresh:** SSO cookies (~30–90 d) outlive JWT (24 h) → headless Playwright re-mints JWT every 20 h.
+
+### Messier — cookie session auth (full spec: `docs/MESSIER_Requirement.md`)
+- **Endpoint:** `POST https://socs1.binus.ac.id/messier/Job.svc/GetActivesJob`
+- **Auth:** `Cookie: .ASPXAUTH=...` (ASP.NET Forms Auth, sliding expiry). NO bearer token. NO custom required headers (beyond `X-Requested-With`, `Content-Type`, `Referer`).
+- **Backend:** classic ASP.NET WCF (not Azure Functions like LMS).
+- **POST body:** `{"type": "future"}`.
+- **Single endpoint returns both `teaching` and `correction_deadline` items** — discriminate by `JobType`:
+  - `"Teaching"` / `"Exam Proctor"` → `teaching`
+  - `"Marking"` → `correction_deadline`
+  - Unknown → `other` (log warning)
+- **Login flow:** `Login.aspx` → manual login → `Home.aspx` (`.ASPXAUTH` issued).
+- **Refresh:** `.ASPXAUTH` is sliding-expiry; `page.goto(Home.aspx)` every ~25 min bumps the timeout forward. If response goes back to `Login.aspx`, session is dead.
+
+### Messier response quirks the scraper MUST handle
+- **ASP.NET date format:** `/Date(<ms>+<tz>)/` — parse with regex, milliseconds are UTC epoch.
+- **`Id` is always `"00000000-0000-0000-0000-000000000000"`** — DO NOT use. Build composite SHA1 from `Note` + `StartDate`.
+- **`Status` is inconsistent:** `"NotDone"` vs `"Not Done"` vs `"Done"` — normalize: `s.strip().replace(" ", "").lower()`.
+- **`IsSubstitute` flag is unreliable** — substitute jobs have `IsSubstitute: false` but `"(Substitute)"` prefix in `Description`. Trust the prefix.
+- **`LatestDate` is `253370739600000` (year 9999) for Marking** — sentinel meaning "no upper deadline." Ignore; use `EndDate`.
+- **Filter `done` items** — completed jobs would generate stale reminders.
+- **For `Marking` jobs:** use `EndDate` as the event `start` (it's the grading deadline). `StartDate` is when the marking window opens — not directly useful as a reminder target.
 
 ## Where we are
 Check `PHASES.md` and repo state:
@@ -82,13 +114,26 @@ event_id = hashlib.sha1(f"{source}|{title}|{start.isoformat()}".encode()).hexdig
 ```
 Makes upsert idempotent.
 
-### Auth strategy
-- We capture the bearer JWT via Playwright `page.on("request", ...)` listener on first interactive login.
-- We save BOTH the JWT AND the Playwright `storage_state` (cookies) — cookies are the long-lived refresh credential.
-- A `refresh_job` runs every 20h: headless Playwright loads cookies → navigates to dashboard → captures fresh JWT silently.
-- API scraping uses `httpx` + saved JWT, never Playwright (too slow per scrape).
-- On 401 from the API: scraper triggers ONE refresh attempt; if it succeeds, retry the call; if it fails, raise `SessionExpired` → DM user to re-auth interactively.
-- **`auth_state_*.json` files must be `chmod 600`** after creation — they contain credentials.
+### Auth strategy — TWO modes (dispatch on `auth_mode`)
+
+**LMS — `auth_mode: "bearer"`:**
+- Capture JWT via Playwright `page.on("request", ...)` listener on first interactive login.
+- Save JWT + Playwright `storage_state` (SSO cookies) + custom headers + POST body.
+- `refresh_job_lms` runs every 20 h: headless Playwright loads SSO cookies → navigates to dashboard → captures fresh JWT silently.
+- API scraping uses `httpx` + saved JWT (never Playwright per scrape — too slow).
+- On 401: scraper triggers ONE `auth.refresh("lms")` attempt; retry. Still 401 → `SessionExpired` → DM user.
+
+**Messier — `auth_mode: "cookie"`:**
+- Just capture Playwright `storage_state` (includes `.ASPXAUTH`).
+- No bearer token to extract, no custom headers to record.
+- `refresh_job_messier` runs every ~25 min: headless Playwright with saved cookies → `page.goto(Home.aspx)` → sliding expiry bumped → save updated cookies.
+- API scraping uses `httpx` + cookies from `storage_state`.
+- On 302→`Login.aspx`: scraper triggers ONE `auth.refresh("messier")`; retry. Still 302 → `SessionExpired` → DM user.
+
+**Both modes:**
+- `auth_state_<portal>.json` MUST be `chmod 600` after creation.
+- Files contain credentials — gitignored, never logged, never pasted into Discord/GitHub/screenshots.
+- `auth.refresh(portal)` and `auth.is_session_valid(portal)` dispatch internally on `auth_mode`. Callers stay agnostic.
 
 ### Scraper interface
 Subclass `src/scrapers/base.Scraper`. Implement `async fetch(start, end) -> list[Event]`. Register in `REGISTRY`. Don't bypass.
@@ -213,9 +258,17 @@ ollama ps
 - Don't call paid LLM APIs. Don't add OpenAI/Anthropic/Google SDK deps. Local Ollama only.
 - Don't let the LLM directly produce events or DB writes.
 - Don't add `delete`/`edit` actions to the LLM intent schema.
-- Don't use cookies alone for API auth — the schedule API needs bearer header.
-- Don't run Playwright on every scrape — it's only for first login + refresh job.
-- Don't try to decrypt `persist:lms` (CryptoJS). Capture the token from network instead.
+- Don't conflate LMS and Messier auth — LMS = bearer JWT, Messier = `.ASPXAUTH` cookie. They're different code paths inside `auth.py`.
+- Don't loop Date-v1 per day for LMS — use Month-v1 (one call per month). Date-v1 is the debug fallback only.
+- Don't zero-pad LMS URL dates — `2026-5-1`, not `2026-05-01`.
+- Don't try to map every `scheduleType` to a unique `EventType` — `Onsite`/`Online`/`Virtual Class` all collapse to `class`; `Event` collapses to `other`.
+- Don't run Playwright on every scrape — it's only for first login + the periodic refresh job.
+- Don't try to decrypt LMS's `persist:lms` (CryptoJS). Capture the JWT from network instead.
+- Don't use Messier's `Id` field for deduplication — it's always all-zeros. Build composite SHA1 from `Note` + `StartDate`.
+- Don't compare Messier `Status` strings directly — normalize first (`strip().replace(" ", "").lower()`). `"NotDone"` and `"Not Done"` are the same value.
+- Don't trust Messier's `IsSubstitute` flag — check for `"(Substitute)"` prefix in `Description` instead.
+- Don't use Messier's `LatestDate` for Marking jobs — it's a year-9999 sentinel. Use `EndDate` (the actual deadline).
+- Don't include `done`-status Messier jobs — filter them out so completed work doesn't generate stale reminders.
 - Don't store credentials in code or commit messages.
 - Don't add general-purpose chat — reply with scope reminder.
 - Don't use Message Content Intent — `dm_messages` is sufficient.
@@ -224,9 +277,14 @@ ollama ps
 
 ## Debugging tips
 
-### Scraper / auth
-- **Returns 401** → JWT expired; scraper should have triggered refresh. Check `refresh_log` for failures. If refresh also failed (False), SSO cookies are dead → run `python -m src.auth --portal=<x>` interactively.
-- **Refresh returns False** → headless Playwright was redirected to login. `ls -la auth_state_*.json` to confirm file isn't 0 bytes. Look at `data/last_failed_payload_*.json` for clues. Re-login interactively.
+### Scraper / auth (LMS — bearer)
+- **Returns 401** → JWT expired; scraper should have triggered `auth.refresh("lms")`. Check `refresh_log WHERE portal='lms'`. If refresh also failed → SSO cookies dead → `python -m src.auth --portal=lms` interactively.
+- **Refresh returns False** → headless Playwright redirected to login. Check `auth_state_lms.json` isn't 0 bytes. Re-login.
+
+### Scraper / auth (Messier — cookie)
+- **Returns 302 / HTML page** → `.ASPXAUTH` expired; scraper should have triggered `auth.refresh("messier")`. Check `refresh_log WHERE portal='messier'`. If refresh also failed → re-login interactively.
+- **Refresh returns False** → headless Playwright landed on `Login.aspx`. The `.ASPXAUTH` is permanently dead. Re-login.
+- **Random 302s mid-day** → `MESSIER_REFRESH_INTERVAL_MIN=25` may be too long. Lower to 15.
 - **Empty events** → check `sync_log` per scraper; if no errors, the endpoint shape may have changed. Capture fresh sample.
 
 ### Reminders
