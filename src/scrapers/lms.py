@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from src import auth, config
+from src import auth, config, db
 from src.parser import Event, EventType
 from src.scrapers.base import Scraper, SessionExpired
 
@@ -168,7 +168,7 @@ class LMSScraper(Scraper):
             return "assignment_deadline"
         if schedule_type in {"Onsite", "Online", "Virtual Class"}:
             return "class"
-        if schedule_type == "Event":
+        if schedule_type in {"Event", "Onsite Exam"}:
             return "other"
         logger.warning("Unknown LMS scheduleType %r; treating as other", schedule_type)
         return "other"
@@ -251,7 +251,15 @@ def _prefixed(label: str, value: Any) -> str | None:
 async def _run_cli(days: int) -> int:
     today = datetime.now(tz=config.TZ).date()
     end = today + timedelta(days=days)
-    events = await LMSScraper().fetch(today, end)
+    try:
+        events = await LMSScraper().fetch(today, end)
+        inserted, updated = db.upsert_events(events)
+        db.log_sync("lms", True, inserted, updated)
+    except Exception as exc:
+        db.log_sync("lms", False, error=str(exc))
+        raise
+
+    print(f"synced {len(events)} events ({inserted} new, {updated} updated)")
     if not events:
         print(f"No LMS events from {today} through {end}.")
         return 0
