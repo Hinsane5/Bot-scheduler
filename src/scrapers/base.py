@@ -11,6 +11,10 @@ from datetime import date
 from src.parser import Event
 
 
+class SessionExpired(RuntimeError):
+    """Raised when a scraper cannot recover an expired portal session."""
+
+
 class Scraper(ABC):
     name: str
 
