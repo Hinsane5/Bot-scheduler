@@ -47,6 +47,8 @@ EMBED_COLOR = discord.Color.blurple()
 # Discord limits — be conservative.
 EMBED_DESCRIPTION_MAX = 4000
 EMBED_FIELD_VALUE_MAX = 1000
+LIST_PAGE_SIZE = 6
+LIST_MAX_EVENTS = 180
 
 
 def _fmt_day(d: date) -> str:
@@ -546,6 +548,151 @@ def build_upcoming_embed(
     )
 
 
+def list_filter_label(event_type: str | None, days_window: int | None) -> str:
+    parts: list[str] = []
+    if event_type:
+        icon = TYPE_ICONS.get(event_type, "")
+        parts.append(f"{icon} {event_type}")
+    if days_window is not None:
+        parts.append("next 1 day" if days_window == 1 else f"next {days_window} days")
+    return " · ".join(parts)
+
+
+def get_list_events(
+    event_type: str | None = None,
+    days_window: int | None = None,
+    now: datetime | None = None,
+) -> list[Event]:
+    if now is None:
+        now = datetime.now(tz=config.TZ)
+    end_dt = now + timedelta(days=days_window) if days_window is not None else None
+    return db.list_events(
+        start=now,
+        end=end_dt,
+        type=event_type,
+        limit=LIST_MAX_EVENTS,
+    )
+
+
+def build_list_embed(
+    events: list[Event],
+    page: int,
+    *,
+    event_type: str | None = None,
+    days_window: int | None = None,
+    now: datetime | None = None,
+) -> discord.Embed:
+    """Build one page of the paginated /list UI."""
+    if now is None:
+        now = datetime.now(tz=config.TZ)
+
+    total_pages = max(1, (len(events) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    filter_label = list_filter_label(event_type, days_window)
+    title = "Schedule"
+    if filter_label:
+        title = f"{title} · {filter_label}"
+
+    if not events:
+        embed = discord.Embed(
+            title=title,
+            description="_Nothing upcoming in this window._",
+            color=EMBED_COLOR,
+            timestamp=now,
+        )
+        embed.set_footer(text="Page 1/1 · 0 events")
+        return embed
+
+    start_idx = page * LIST_PAGE_SIZE
+    page_events = events[start_idx : start_idx + LIST_PAGE_SIZE]
+    embed = discord.Embed(
+        title=f"{title} · {len(events)} events",
+        color=EMBED_COLOR,
+        timestamp=now,
+    )
+    for event in page_events:
+        icon = TYPE_ICONS.get(event.type, "•")
+        date_label = _fmt_full_date(event.start.date())
+        time_label = event.start.strftime("%H:%M")
+        if event.end is not None:
+            time_label += f" - {event.end.strftime('%H:%M')}"
+        detail_parts = [f"`{time_label}`"]
+        if event.location:
+            detail_parts.append(discord.utils.escape_markdown(event.location))
+        if event.link:
+            detail_parts.append(f"[link]({event.link})")
+        if event.source == "manual":
+            detail_parts.append(f"id `{event.id}`")
+        detail_parts.append(event.source)
+        embed.add_field(
+            name=_truncate(f"{icon} {date_label} · {event.title}", 256),
+            value=_truncate(" · ".join(detail_parts), EMBED_FIELD_VALUE_MAX),
+            inline=False,
+        )
+
+    first_item = start_idx + 1
+    last_item = start_idx + len(page_events)
+    embed.set_footer(
+        text=(
+            f"Page {page + 1}/{total_pages} · Showing {first_item}-{last_item} "
+            f"of {len(events)} · {config.TIMEZONE}"
+        )
+    )
+    return embed
+
+
+class ScheduleListView(discord.ui.View):
+    def __init__(
+        self,
+        events: list[Event],
+        *,
+        event_type: str | None,
+        days_window: int | None,
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.events = events
+        self.event_type = event_type
+        self.days_window = days_window
+        self.owner_id = owner_id
+        self.page = 0
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("This schedule page belongs to another interaction.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.page = max(0, self.page - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.events) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+
+    def embed(self) -> discord.Embed:
+        return build_list_embed(
+            self.events,
+            self.page,
+            event_type=self.event_type,
+            days_window=self.days_window,
+        )
+
+    def _sync_buttons(self) -> None:
+        self.prev_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.total_pages - 1
+
+
 # --- bot --------------------------------------------------------------------
 
 class TimetableBot(discord.Client):
@@ -595,6 +742,18 @@ class TimetableBot(discord.Client):
             await interaction.response.send_message(
                 embed=build_upcoming_embed(effective_count, type_value, days_window=days)
             )
+
+        @self.tree.command(name="list-schedule", description="Browse upcoming schedule pages with Prev/Next buttons")
+        async def list_schedule_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            events = get_list_events()
+            view = ScheduleListView(
+                events,
+                event_type=None,
+                days_window=None,
+                owner_id=interaction.user.id,
+            )
+            await interaction.followup.send(embed=view.embed(), view=view)
 
         @self.tree.command(name="add", description="Add a manual meeting or other event")
         @app_commands.describe(
