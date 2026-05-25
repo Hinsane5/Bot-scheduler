@@ -693,6 +693,46 @@ class ScheduleListView(discord.ui.View):
         self.next_page.disabled = self.page >= self.total_pages - 1
 
 
+async def send_schedule_list(interaction: discord.Interaction) -> None:
+    """Send the paginated schedule UI with a channel fallback.
+
+    Discord invalidates slash interaction tokens quickly. If the bot was
+    delayed after being idle, even the initial ``defer`` can fail with
+    ``Unknown interaction``. In that case we still send the page as a normal
+    channel message so the command remains useful instead of crashing.
+    """
+    try:
+        await interaction.response.defer()
+        deferred = True
+    except discord.NotFound:
+        deferred = False
+
+    events = get_list_events()
+    view = ScheduleListView(
+        events,
+        event_type=None,
+        days_window=None,
+        owner_id=interaction.user.id,
+    )
+    embed = view.embed()
+
+    if deferred:
+        try:
+            await interaction.followup.send(embed=embed, view=view)
+            return
+        except discord.NotFound:
+            logger.warning("list-schedule followup expired; falling back to channel send")
+
+    channel = interaction.channel
+    if channel is None:
+        logger.warning("list-schedule interaction expired and no channel is available")
+        return
+    try:
+        await channel.send(embed=embed, view=view)  # type: ignore[union-attr]
+    except discord.HTTPException:
+        logger.exception("list-schedule channel fallback failed")
+
+
 # --- bot --------------------------------------------------------------------
 
 class TimetableBot(discord.Client):
@@ -745,15 +785,7 @@ class TimetableBot(discord.Client):
 
         @self.tree.command(name="list-schedule", description="Browse upcoming schedule pages with Prev/Next buttons")
         async def list_schedule_cmd(interaction: discord.Interaction) -> None:
-            await interaction.response.defer()
-            events = get_list_events()
-            view = ScheduleListView(
-                events,
-                event_type=None,
-                days_window=None,
-                owner_id=interaction.user.id,
-            )
-            await interaction.followup.send(embed=view.embed(), view=view)
+            await send_schedule_list(interaction)
 
         @self.tree.command(name="add", description="Add a manual meeting or other event")
         @app_commands.describe(
