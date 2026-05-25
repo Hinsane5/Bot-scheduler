@@ -35,13 +35,36 @@ _SYNC_LOOKAHEAD_DAYS = 30
 
 
 async def sync_job(bot: discord.Client) -> None:
-    """Run all enabled scrapers, one at a time, each in its own try/except."""
+    """Run all enabled scrapers, one at a time, each in its own try/except.
+
+    After scrapers finish (success or failure), reschedule all reminder
+    jobs so new/changed events get DM reminders.
+    """
     for name in config.ENABLED_SCRAPERS:
         scraper = REGISTRY.get(name)
         if scraper is None:
             logger.warning("[sync] scraper %r not in REGISTRY; skipping", name)
             continue
         await _run_one_scraper(bot, name, scraper)
+    await _reschedule_reminders(bot)
+
+
+async def _reschedule_reminders(bot: discord.Client) -> None:
+    """Rebuild the reminder schedule from current DB state.
+
+    Pulled out so failures here don't mask sync failures and vice versa.
+    """
+    scheduler = getattr(bot, "scheduler", None)
+    if scheduler is None:
+        logger.warning("[sync] bot has no scheduler attached; skipping reschedule")
+        return
+    try:
+        # Local import to avoid circular: jobs.py and reminders.py are peers.
+        from src import reminders
+
+        await reminders.reschedule_all(bot, scheduler)
+    except Exception:
+        logger.exception("[sync] reminder reschedule failed")
 
 
 async def _run_one_scraper(bot: discord.Client, name: str, scraper: Any) -> None:

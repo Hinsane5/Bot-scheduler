@@ -121,6 +121,31 @@ def register_jobs(scheduler: AsyncIOScheduler, bot) -> None:
         config.TIMEZONE,
     )
 
+    # One-shot at boot+10s: schedule reminders for all existing DB events
+    # so we don't have to wait for the first sync_job (+30s) to do it.
+    # Waits for bot.is_ready() so user fetch works inside any reminder
+    # that fires immediately after.
+    scheduler.add_job(
+        _initial_reminder_setup,
+        trigger="date",
+        run_date=now + timedelta(seconds=10),
+        args=[bot, scheduler],
+        id="initial_reminder_setup",
+        name="schedule reminders from existing DB events",
+    )
+    log.info("Registered initial_reminder_setup: one-shot at boot+10s")
+
+
+async def _initial_reminder_setup(bot, scheduler) -> None:
+    """Wait briefly for bot to be ready, then schedule reminders from DB."""
+    from src import reminders
+
+    for _ in range(30):
+        if bot.is_ready():
+            break
+        await asyncio.sleep(1)
+    await reminders.reschedule_all(bot, scheduler)
+
 
 async def amain() -> None:
     bot = create_bot()
