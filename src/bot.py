@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from datetime import date, datetime, time, timedelta
 from typing import Iterable
 
 import discord
 from discord import app_commands
 
-from src import config, db
+from src import config, db, reminders
 from src.parser import Event
 
 
@@ -32,6 +33,11 @@ TYPE_CHOICES: list[app_commands.Choice[str]] = [
     app_commands.Choice(name="👨‍🏫 Teaching", value="teaching"),
     app_commands.Choice(name="📝 Assignment deadline", value="assignment_deadline"),
     app_commands.Choice(name="✍️ Correction deadline", value="correction_deadline"),
+    app_commands.Choice(name="💼 Meeting", value="meeting"),
+    app_commands.Choice(name="📌 Other", value="other"),
+]
+
+MANUAL_TYPE_CHOICES: list[app_commands.Choice[str]] = [
     app_commands.Choice(name="💼 Meeting", value="meeting"),
     app_commands.Choice(name="📌 Other", value="other"),
 ]
@@ -77,6 +83,231 @@ def format_event_line(event: Event) -> str:
 
 def _events_on_day(events: Iterable[Event], target: date) -> list[Event]:
     return [e for e in events if e.start.date() == target]
+
+
+def parse_local_datetime(value: str, field_name: str = "time") -> datetime:
+    """Parse a user-supplied local datetime in ``YYYY-MM-DD HH:MM`` format."""
+    try:
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must use `YYYY-MM-DD HH:MM`.") from exc
+    return parsed.replace(tzinfo=config.TZ)
+
+
+def parse_reminder_minutes(value: str | None, default: list[int]) -> list[int]:
+    if value is None or not value.strip():
+        return list(default)
+    reminders_out: list[int] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            minutes = int(raw)
+        except ValueError as exc:
+            raise ValueError("remind_before must be comma-separated minutes, e.g. `10` or `1440,60`.") from exc
+        if minutes < 0:
+            raise ValueError("remind_before values must be zero or greater.")
+        reminders_out.append(minutes)
+    return reminders_out or list(default)
+
+
+def make_manual_event_id(title: str, start: datetime) -> str:
+    raw = f"manual|{title}|{start.isoformat()}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def build_manual_event(
+    *,
+    type_value: str,
+    title: str,
+    start_text: str,
+    end_text: str | None = None,
+    location: str | None = None,
+    link: str | None = None,
+    notes: str | None = None,
+    remind_before: str | None = None,
+    event_id: str | None = None,
+) -> Event:
+    if type_value not in {"meeting", "other"}:
+        raise ValueError("Manual events can only be `meeting` or `other`.")
+    clean_title = title.strip()
+    if not clean_title:
+        raise ValueError("title cannot be empty.")
+
+    start = parse_local_datetime(start_text, "start")
+    end = parse_local_datetime(end_text, "end") if end_text and end_text.strip() else None
+    if end is not None and end <= start:
+        raise ValueError("end must be after start.")
+
+    default_reminders = config.DEFAULT_REMINDERS_BY_TYPE[type_value]
+    return Event(
+        id=event_id or make_manual_event_id(clean_title, start),
+        source="manual",
+        type=type_value,  # type: ignore[arg-type]
+        title=clean_title,
+        start=start,
+        end=end,
+        location=_clean_optional(location),
+        link=_clean_optional(link),
+        notes=_clean_optional(notes),
+        remind_before=parse_reminder_minutes(remind_before, default_reminders),
+    )
+
+
+def _clean_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _event_to_embed(event: Event, title: str) -> discord.Embed:
+    embed = discord.Embed(title=title, color=EMBED_COLOR)
+    embed.description = format_event_line(event)
+    embed.add_field(name="ID", value=f"`{event.id}`", inline=True)
+    embed.add_field(name="Type", value=event.type, inline=True)
+    embed.add_field(name="Source", value=event.source, inline=True)
+    embed.add_field(name="Reminders", value=", ".join(str(m) for m in event.remind_before) or "none", inline=False)
+    if event.notes:
+        embed.add_field(name="Notes", value=_truncate(discord.utils.escape_markdown(event.notes), EMBED_FIELD_VALUE_MAX), inline=False)
+    return embed
+
+
+async def schedule_manual_event(event: Event, interaction: discord.Interaction) -> None:
+    scheduler = getattr(interaction.client, "scheduler", None)
+    if scheduler is None:
+        return
+    reminders.schedule_for(event, interaction.client, scheduler)
+
+
+async def reschedule_manual_events(interaction: discord.Interaction) -> None:
+    scheduler = getattr(interaction.client, "scheduler", None)
+    if scheduler is None:
+        return
+    await reminders.reschedule_all(interaction.client, scheduler)
+
+
+class DeleteConfirmView(discord.ui.View):
+    def __init__(self, event: Event) -> None:
+        super().__init__(timeout=30)
+        self.event = event
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        deleted = db.delete_event(self.event.id, manual_only=True)
+        if deleted:
+            await reschedule_manual_events(interaction)
+            embed = _event_to_embed(self.event, "Deleted manual event")
+            await interaction.response.edit_message(embed=embed, view=None)
+        else:
+            await interaction.response.edit_message(
+                content="That manual event no longer exists.",
+                embed=None,
+                view=None,
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Delete cancelled.", embed=None, view=None)
+
+
+class EditEventModal(discord.ui.Modal):
+    def __init__(self, event: Event) -> None:
+        super().__init__(title=f"Edit {event.id}")
+        self.event = event
+
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            default=event.title,
+            max_length=200,
+        )
+        self.start_input = discord.ui.TextInput(
+            label="Start (YYYY-MM-DD HH:MM)",
+            default=event.start.strftime("%Y-%m-%d %H:%M"),
+            max_length=16,
+        )
+        self.end_input = discord.ui.TextInput(
+            label="End (YYYY-MM-DD HH:MM, optional)",
+            default=event.end.strftime("%Y-%m-%d %H:%M") if event.end else "",
+            required=False,
+            max_length=16,
+        )
+        self.location_input = discord.ui.TextInput(
+            label="Location/link/notes",
+            default=self._packed_optional_fields(event),
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=600,
+        )
+        self.reminders_input = discord.ui.TextInput(
+            label="Reminder minutes",
+            default=",".join(str(m) for m in event.remind_before),
+            required=False,
+            max_length=80,
+        )
+
+        self.add_item(self.title_input)
+        self.add_item(self.start_input)
+        self.add_item(self.end_input)
+        self.add_item(self.location_input)
+        self.add_item(self.reminders_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            location, link, notes = self._unpack_optional_fields(str(self.location_input.value))
+            updated = build_manual_event(
+                type_value=self.event.type,
+                title=str(self.title_input.value),
+                start_text=str(self.start_input.value),
+                end_text=str(self.end_input.value),
+                location=location,
+                link=link,
+                notes=notes,
+                remind_before=str(self.reminders_input.value),
+                event_id=self.event.id,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
+
+        _, updated_count = db.upsert_events([updated])
+        await reschedule_manual_events(interaction)
+        embed_title = "Updated manual event" if updated_count else "Manual event unchanged"
+        await interaction.response.send_message(
+            embed=_event_to_embed(updated, embed_title),
+            ephemeral=True,
+        )
+
+    @staticmethod
+    def _packed_optional_fields(event: Event) -> str:
+        lines = []
+        if event.location:
+            lines.append(f"location: {event.location}")
+        if event.link:
+            lines.append(f"link: {event.link}")
+        if event.notes:
+            lines.append(f"notes: {event.notes}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _unpack_optional_fields(value: str) -> tuple[str | None, str | None, str | None]:
+        location: str | None = None
+        link: str | None = None
+        notes_lines: list[str] = []
+        for line in value.splitlines():
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if lowered.startswith("location:"):
+                location = stripped.split(":", 1)[1].strip() or None
+            elif lowered.startswith("link:"):
+                link = stripped.split(":", 1)[1].strip() or None
+            elif lowered.startswith("notes:"):
+                notes_lines.append(stripped.split(":", 1)[1].strip())
+            elif stripped:
+                notes_lines.append(stripped)
+        notes = "\n".join(line for line in notes_lines if line).strip() or None
+        return location, link, notes
 
 
 # --- embed builders ---------------------------------------------------------
@@ -357,6 +588,85 @@ class TimetableBot(discord.Client):
             await interaction.response.send_message(
                 embed=build_upcoming_embed(effective_count, type_value, days_window=days)
             )
+
+        @self.tree.command(name="add", description="Add a manual meeting or other event")
+        @app_commands.describe(
+            type="Manual event type",
+            title="Event title",
+            start="Start time in YYYY-MM-DD HH:MM",
+            end="Optional end time in YYYY-MM-DD HH:MM",
+            location="Optional location",
+            link="Optional URL",
+            remind_before="Optional comma-separated reminder minutes, e.g. 10 or 1440,60",
+            notes="Optional notes",
+        )
+        @app_commands.choices(type=MANUAL_TYPE_CHOICES)
+        async def add_cmd(
+            interaction: discord.Interaction,
+            type: app_commands.Choice[str],
+            title: str,
+            start: str,
+            end: str | None = None,
+            location: str | None = None,
+            link: str | None = None,
+            remind_before: str | None = None,
+            notes: str | None = None,
+        ) -> None:
+            try:
+                event = build_manual_event(
+                    type_value=type.value,
+                    title=title,
+                    start_text=start,
+                    end_text=end,
+                    location=location,
+                    link=link,
+                    notes=notes,
+                    remind_before=remind_before,
+                )
+            except ValueError as exc:
+                await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+                return
+
+            inserted, updated = db.upsert_events([event])
+            await schedule_manual_event(event, interaction)
+            if inserted:
+                embed_title = "Saved manual event"
+            elif updated:
+                embed_title = "Updated existing manual event"
+            else:
+                embed_title = "Manual event already exists"
+            await interaction.response.send_message(
+                embed=_event_to_embed(event, embed_title),
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="delete", description="Delete a manually-added event")
+        @app_commands.describe(id="Manual event ID or unique ID prefix")
+        async def delete_cmd(interaction: discord.Interaction, id: str) -> None:
+            event = db.find_event_by_prefix(id, manual_only=True)
+            if event is None:
+                await interaction.response.send_message(
+                    "No unique manual event matched that ID.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                embed=_event_to_embed(event, "Delete this manual event?"),
+                view=DeleteConfirmView(event),
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="edit", description="Edit a manually-added event")
+        @app_commands.describe(id="Manual event ID or unique ID prefix")
+        async def edit_cmd(interaction: discord.Interaction, id: str) -> None:
+            event = db.find_event_by_prefix(id, manual_only=True)
+            if event is None:
+                await interaction.response.send_message(
+                    "No unique manual event matched that ID.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(EditEventModal(event))
 
         @self.tree.error
         async def on_app_error(

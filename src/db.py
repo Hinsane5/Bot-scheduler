@@ -221,6 +221,31 @@ def get_event(event_id: str, db_path: Path | str = DB_PATH) -> Event | None:
     return _row_to_event(row) if row else None
 
 
+def find_event_by_prefix(
+    event_id_prefix: str,
+    *,
+    manual_only: bool = False,
+    db_path: Path | str = DB_PATH,
+) -> Event | None:
+    init(db_path)
+    prefix = event_id_prefix.strip()
+    if not prefix:
+        return None
+
+    query = f"SELECT {', '.join(EVENT_COLUMNS)} FROM events WHERE id LIKE ?"
+    params: list[Any] = [f"{prefix}%"]
+    if manual_only:
+        query += " AND source = ?"
+        params.append("manual")
+    query += " ORDER BY start ASC LIMIT 2"
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    if len(rows) != 1:
+        return None
+    return _row_to_event(rows[0])
+
+
 def delete_event(event_id: str, *, manual_only: bool = False, db_path: Path | str = DB_PATH) -> bool:
     init(db_path)
     query = "DELETE FROM events WHERE id = ?"
