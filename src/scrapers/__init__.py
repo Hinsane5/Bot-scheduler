@@ -9,6 +9,7 @@ from src.scrapers.base import Scraper
 
 if TYPE_CHECKING:
     from src.scrapers.lms import LMSScraper
+    from src.scrapers.messier import MessierScraper
 
 
 class ScraperRegistry(MutableMapping[str, Scraper]):
@@ -38,8 +39,10 @@ class ScraperRegistry(MutableMapping[str, Scraper]):
         if self._scrapers:
             return
         from src.scrapers.lms import LMSScraper
+        from src.scrapers.messier import MessierScraper
 
         self._scrapers["lms"] = LMSScraper()
+        self._scrapers["messier"] = MessierScraper()
 
 
 REGISTRY: MutableMapping[str, Scraper] = ScraperRegistry()
