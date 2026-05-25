@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from src import config, jobs
+from src import config, jobs, reminders
 from src.bot import create_bot
 
 
@@ -134,6 +134,23 @@ def register_jobs(scheduler: AsyncIOScheduler, bot) -> None:
         name="schedule reminders from existing DB events",
     )
     log.info("Registered initial_reminder_setup: one-shot at boot+10s")
+
+    # Daily morning summary at 00:00 local time.
+    # misfire_grace_time=3600 → if bot starts at 00:30, still send today's
+    # summary; if it starts at 02:00, the run was missed by too much, skip.
+    scheduler.add_job(
+        reminders.daily_summary,
+        trigger="cron",
+        hour=0,
+        minute=0,
+        args=[bot],
+        id="daily_summary_job",
+        name="DM morning summary of today's events",
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    log.info("Registered daily_summary_job: daily at 00:00 %s", config.TIMEZONE)
 
 
 async def _initial_reminder_setup(bot, scheduler) -> None:

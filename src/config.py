@@ -40,10 +40,13 @@ OLLAMA_KEEP_ALIVE_MIN = int(os.getenv("OLLAMA_KEEP_ALIVE_MIN", "4"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DEFAULT_REMINDERS_BY_TYPE = {
-    "class": [10],
-    "teaching": [10],
+    # Academic events get a four-step ramp before they start / are due.
+    "class": [120, 60, 30, 10],
+    "teaching": [120, 60, 30, 10],
+    "assignment_deadline": [120, 60, 30, 10],
+    "correction_deadline": [120, 60, 30, 10],
+    # Personal events default to a single 10-min nudge — user can override
+    # per-event via /add remind_before:....
     "meeting": [10],
     "other": [10],
-    "assignment_deadline": [1440, 60],
-    "correction_deadline": [1440, 60],
 }

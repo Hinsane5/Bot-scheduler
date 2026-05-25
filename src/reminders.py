@@ -23,7 +23,7 @@ restarts mid-fire and the new ``reschedule_all`` re-adds the same job.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import discord
@@ -228,6 +228,94 @@ def _humanize_lead(lead_min: int) -> str:
     if hours == 0:
         return f"in {days} days"
     return f"in {days}d {hours}h"
+
+
+async def daily_summary(bot: Any) -> None:
+    """Send the user a DM summarizing all of today's events.
+
+    Designed to fire at 00:00 Asia/Jakarta. Silently skips if there
+    are no events today (don't ping for nothing).
+    """
+    now = datetime.now(tz=config.TZ)
+    today = now.date()
+    start_dt = datetime.combine(today, time.min, tzinfo=config.TZ)
+    end_dt = datetime.combine(today, time.max, tzinfo=config.TZ)
+
+    try:
+        events = db.list_events(start=start_dt, end=end_dt)
+    except Exception:
+        logger.exception("[daily_summary] db.list_events failed")
+        return
+
+    if not events:
+        logger.info("[daily_summary] no events for %s; skipping DM", today.isoformat())
+        return
+
+    if not bot.is_ready():
+        logger.warning("[daily_summary] bot not ready; skipping DM")
+        return
+
+    user_id = config.DISCORD_USER_ID
+    if not user_id:
+        logger.warning("[daily_summary] DISCORD_USER_ID not set; cannot DM")
+        return
+    try:
+        uid = int(user_id)
+    except ValueError:
+        logger.warning("[daily_summary] DISCORD_USER_ID=%r is not an integer", user_id)
+        return
+
+    embed = _build_daily_summary_embed(today, events)
+    try:
+        user = await bot.fetch_user(uid)
+        await user.send(embed=embed)
+    except Exception:
+        logger.exception("[daily_summary] DM failed")
+        return
+
+    logger.info(
+        "[daily_summary] sent for %s: %d event(s)",
+        today.isoformat(),
+        len(events),
+    )
+
+
+def _build_daily_summary_embed(today: date, events: list[Event]) -> discord.Embed:
+    """Compose the morning summary embed."""
+    title = f"🌅 Good morning · {today:%a, %d %b %Y}"
+    word = "event" if len(events) == 1 else "events"
+    embed = discord.Embed(
+        title=title,
+        description=f"You have **{len(events)}** {word} today.",
+        color=discord.Color.gold(),
+        timestamp=datetime.combine(today, time.min, tzinfo=config.TZ),
+    )
+
+    lines: list[str] = []
+    for e in events:
+        icon = _TYPE_ICONS.get(e.type, "•")
+        time_str = e.start.strftime("%H:%M")
+        if e.end is not None:
+            time_str += f"–{e.end.strftime('%H:%M')}"
+        title_esc = discord.utils.escape_markdown(e.title)
+        parts = [f"{icon} `{time_str}` **{title_esc}**"]
+        if e.location:
+            parts.append(f"· {discord.utils.escape_markdown(e.location)}")
+        if e.link:
+            parts.append(f"· [link]({e.link})")
+        lines.append(" ".join(parts))
+
+    schedule_text = "\n".join(lines)
+    # Discord field value cap is 1024 — truncate if needed.
+    if len(schedule_text) > 1020:
+        schedule_text = schedule_text[:1015] + "\n…"
+    embed.add_field(
+        name=f"📅 {today:%A}",
+        value=schedule_text,
+        inline=False,
+    )
+    embed.set_footer(text="Per-event reminders fire 2h, 1h, 30m, 10m before start.")
+    return embed
 
 
 def _build_reminder_embed(event: Event, lead_min: int, now: datetime) -> discord.Embed:
