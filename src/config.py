@@ -23,7 +23,7 @@ DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "")
 LMS_BASE_URL = os.getenv("LMS_BASE_URL", "https://lms.binus.ac.id")
 MESSIER_BASE_URL = os.getenv("MESSIER_BASE_URL", "https://socs1.binus.ac.id/messier")
 
-SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "15"))
+SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "180"))
 LMS_REFRESH_INTERVAL_HOURS = int(os.getenv("LMS_REFRESH_INTERVAL_HOURS", "20"))
 MESSIER_REFRESH_INTERVAL_MIN = int(os.getenv("MESSIER_REFRESH_INTERVAL_MIN", "25"))
 BACKUP_HOUR_LOCAL = int(os.getenv("BACKUP_HOUR_LOCAL", "3"))

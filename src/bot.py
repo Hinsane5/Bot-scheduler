@@ -140,6 +140,110 @@ def build_week_embed(now: datetime | None = None) -> discord.Embed:
     return embed
 
 
+def build_status_embed(now: datetime | None = None) -> discord.Embed:
+    """Health dashboard: scrapers, sessions, upcoming counts."""
+    if now is None:
+        now = datetime.now(tz=config.TZ)
+
+    embed = discord.Embed(title="🩺 Bot Status", color=EMBED_COLOR)
+
+    # Scraper sync status
+    sync_lines: list[str] = []
+    for name in config.ENABLED_SCRAPERS:
+        last = db.last_sync(name)
+        if last is None:
+            sync_lines.append(f"⏳ **{name}**: never run")
+            continue
+        ran_at = _parse_iso(last["ran_at"])
+        ago = _humanize_past(now - ran_at) if ran_at else "?"
+        if last["success"]:
+            sync_lines.append(
+                f"✅ **{name}**: {ago} ago "
+                f"(+{last.get('inserted') or 0} new, ~{last.get('updated') or 0} upd)"
+            )
+        else:
+            err = (last.get("error") or "").splitlines()[0][:120]
+            sync_lines.append(f"❌ **{name}**: failed {ago} ago — `{err}`")
+    embed.add_field(
+        name="📡 Scrapers",
+        value="\n".join(sync_lines) or "_None enabled._",
+        inline=False,
+    )
+
+    # Session/refresh status per enabled portal
+    refresh_lines: list[str] = []
+    for portal in config.ENABLED_SCRAPERS:
+        last = db.last_refresh(portal)
+        if last is None:
+            refresh_lines.append(f"⏳ **{portal}**: never refreshed")
+            continue
+        ran_at = _parse_iso(last["ran_at"])
+        ago = _humanize_past(now - ran_at) if ran_at else "?"
+        if last["success"]:
+            ttl_suffix = ""
+            exp_str = last.get("new_token_exp")
+            if exp_str:
+                exp_dt = _parse_iso(exp_str)
+                if exp_dt is not None:
+                    ttl = exp_dt - now
+                    if ttl.total_seconds() > 0:
+                        ttl_suffix = f" · TTL {_humanize_past(ttl)}"
+                    else:
+                        ttl_suffix = " · ⚠️ TTL expired"
+            refresh_lines.append(f"✅ **{portal}**: {ago} ago{ttl_suffix}")
+        else:
+            err = (last.get("error") or "").splitlines()[0][:120]
+            refresh_lines.append(f"❌ **{portal}**: failed {ago} ago — `{err}`")
+    embed.add_field(
+        name="🔑 Sessions",
+        value="\n".join(refresh_lines) or "_N/A._",
+        inline=False,
+    )
+
+    # Upcoming event counts
+    end_24h = now + timedelta(hours=24)
+    end_7d = now + timedelta(days=7)
+    count_24h = len(db.list_events(start=now, end=end_24h))
+    count_7d = len(db.list_events(start=now, end=end_7d))
+    embed.add_field(
+        name="📅 Upcoming",
+        value=f"Next 24h: **{count_24h}** · Next 7d: **{count_7d}**",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=f"Sync every {config.SYNC_INTERVAL_MIN} min · {config.TIMEZONE}"
+    )
+    return embed
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=config.TZ)
+    return parsed
+
+
+def _humanize_past(delta: timedelta) -> str:
+    total = int(abs(delta.total_seconds()))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    if total < 86400:
+        hours, rem = divmod(total, 3600)
+        minutes = rem // 60
+        return f"{hours}h{minutes:02d}m" if minutes else f"{hours}h"
+    days, rem = divmod(total, 86400)
+    hours = rem // 3600
+    return f"{days}d{hours:02d}h" if hours else f"{days}d"
+
+
 def build_upcoming_embed(
     count: int,
     event_type: str | None,
@@ -192,6 +296,10 @@ class TimetableBot(discord.Client):
         @self.tree.command(name="week", description="Show the next 7 days of events")
         async def week_cmd(interaction: discord.Interaction) -> None:
             await interaction.response.send_message(embed=build_week_embed())
+
+        @self.tree.command(name="status", description="Show bot health and sync status")
+        async def status_cmd(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(embed=build_status_embed())
 
         @self.tree.command(
             name="upcoming",
