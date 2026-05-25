@@ -1,0 +1,21 @@
+[Unit]
+Description=Bot Timetable Discord scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/bot-timetable
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/bot-timetable/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+# Keep secrets readable only by the service user.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

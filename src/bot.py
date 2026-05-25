@@ -66,7 +66,12 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def format_event_line(event: Event) -> str:
-    """Render an event as one Markdown line for an embed."""
+    """Render an event as one Markdown line for an embed.
+
+    Manual events get their ID appended so the user can copy it into
+    ``/edit`` or ``/delete``. Auto-synced events don't show an ID because
+    they can't be edited/deleted from Discord (only via the portal).
+    """
     icon = TYPE_ICONS.get(event.type, "•")
     time_str = event.start.strftime("%H:%M")
     if event.end is not None:
@@ -78,6 +83,8 @@ def format_event_line(event: Event) -> str:
         parts.append(f"· {discord.utils.escape_markdown(event.location)}")
     if event.link:
         parts.append(f"· [link]({event.link})")
+    if event.source == "manual":
+        parts.append(f"· `{event.id}`")
     return " ".join(parts)
 
 
@@ -674,11 +681,33 @@ class TimetableBot(discord.Client):
             error: app_commands.AppCommandError,
         ) -> None:
             logger.exception("Slash command error", exc_info=error)
-            message = f"⚠️ Error running command: `{error.__class__.__name__}`"
-            if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
-            else:
-                await interaction.response.send_message(message, ephemeral=True)
+
+            # CommandNotFound = Discord routed an unknown command to us
+            # (stale client cache, bot restart mid-flight, etc.). Discord
+            # already shows the user a generic "interaction failed", so
+            # don't try to send our own message — it'll race against the
+            # original interaction's auto-ack and 40060.
+            if isinstance(error, app_commands.CommandNotFound):
+                return
+
+            message = f"⚠️ Error: `{error.__class__.__name__}`"
+            # Wrap everything: by the time we run, the interaction may
+            # have been auto-acknowledged by Discord (3s timeout) OR by
+            # the original handler partially responding before crashing.
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+            except discord.HTTPException:
+                # Initial response path failed — try followup as a fallback.
+                try:
+                    await interaction.followup.send(message, ephemeral=True)
+                except discord.HTTPException:
+                    logger.warning(
+                        "Could not surface error to user (interaction expired/acked)",
+                        exc_info=True,
+                    )
 
     async def setup_hook(self) -> None:
         """Sync slash commands once at startup."""
