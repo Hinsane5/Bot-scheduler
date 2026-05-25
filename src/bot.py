@@ -247,20 +247,52 @@ def _humanize_past(delta: timedelta) -> str:
 def build_upcoming_embed(
     count: int,
     event_type: str | None,
+    days_window: int | None = None,
     now: datetime | None = None,
 ) -> discord.Embed:
+    """Build the /upcoming embed.
+
+    Filters:
+    - ``event_type``: optional type filter (class, teaching, etc.)
+    - ``days_window``: optional integer N — restrict to events in the next
+      N days from now. ``None`` means no upper bound.
+    - ``count``: hard cap on number of events returned.
+    """
     if now is None:
         now = datetime.now(tz=config.TZ)
-    events = db.list_events(start=now, type=event_type, limit=count)
 
-    icon = TYPE_ICONS.get(event_type or "", "")
-    filter_label = f" · {icon} {event_type}" if event_type else ""
-    title_base = f"⏭️ Upcoming{filter_label}"
+    end_dt: datetime | None = None
+    if days_window is not None:
+        end_dt = now + timedelta(days=days_window)
+
+    events = db.list_events(
+        start=now,
+        end=end_dt,
+        type=event_type,
+        limit=count,
+    )
+
+    # Compose title — append each active filter as " · <label>".
+    parts: list[str] = []
+    if event_type:
+        icon = TYPE_ICONS.get(event_type, "")
+        parts.append(f"{icon} {event_type}")
+    if days_window is not None:
+        parts.append("next 1 day" if days_window == 1 else f"next {days_window} days")
+    filter_label = " · ".join(parts)
+    title_base = "⏭️ Upcoming"
+    if filter_label:
+        title_base = f"{title_base} · {filter_label}"
 
     if not events:
+        empty_msg = (
+            "_Nothing upcoming in this window._"
+            if days_window is not None
+            else "_Nothing upcoming in your schedule._"
+        )
         return discord.Embed(
             title=title_base,
-            description="_Nothing upcoming in your schedule._",
+            description=empty_msg,
             color=EMBED_COLOR,
         )
 
@@ -303,21 +335,23 @@ class TimetableBot(discord.Client):
 
         @self.tree.command(
             name="upcoming",
-            description="Show the next N events, optionally filtered by type",
+            description="Show the next N events, optionally filtered by type and time window",
         )
         @app_commands.describe(
             count="How many events to show (1–25, default 5)",
             type="Filter by event type",
+            days="Only events within the next N days (1=tomorrow horizon, 7=one week, …). Omit for no limit.",
         )
         @app_commands.choices(type=TYPE_CHOICES)
         async def upcoming_cmd(
             interaction: discord.Interaction,
             count: app_commands.Range[int, 1, 25] = 5,
             type: app_commands.Choice[str] | None = None,
+            days: app_commands.Range[int, 1, 60] | None = None,
         ) -> None:
             type_value = type.value if type else None
             await interaction.response.send_message(
-                embed=build_upcoming_embed(count, type_value)
+                embed=build_upcoming_embed(count, type_value, days_window=days)
             )
 
         @self.tree.error
