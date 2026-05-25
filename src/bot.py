@@ -338,20 +338,24 @@ class TimetableBot(discord.Client):
             description="Show the next N events, optionally filtered by type and time window",
         )
         @app_commands.describe(
-            count="How many events to show (1–25, default 5)",
+            count="How many events to show (1–50). Default: 5 alone, up to 50 when 'days' is set.",
             type="Filter by event type",
-            days="Only events within the next N days (1=tomorrow horizon, 7=one week, …). Omit for no limit.",
+            days="Only events within the next N days (1=next 24h, 7=one week, …). Omit for no window limit.",
         )
         @app_commands.choices(type=TYPE_CHOICES)
         async def upcoming_cmd(
             interaction: discord.Interaction,
-            count: app_commands.Range[int, 1, 25] = 5,
+            count: app_commands.Range[int, 1, 50] | None = None,
             type: app_commands.Choice[str] | None = None,
             days: app_commands.Range[int, 1, 60] | None = None,
         ) -> None:
             type_value = type.value if type else None
+            # Smart default: explicit count wins. Otherwise:
+            #   - With `days` set, user is asking "what's in this window" — show up to 50.
+            #   - Without `days`, default to next 5 events as before.
+            effective_count = count if count is not None else (50 if days is not None else 5)
             await interaction.response.send_message(
-                embed=build_upcoming_embed(count, type_value, days_window=days)
+                embed=build_upcoming_embed(effective_count, type_value, days_window=days)
             )
 
         @self.tree.error
