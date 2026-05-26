@@ -22,6 +22,7 @@ restarts mid-fire and the new ``reschedule_all`` re-adds the same job.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -64,40 +65,68 @@ def _job_id(event_id: str, lead_min: int) -> str:
     return f"{JOB_ID_PREFIX}{event_id}:{lead_min}"
 
 
-def schedule_for(event: Event, bot: Any, scheduler: AsyncIOScheduler) -> int:
-    """Schedule one reminder job per lead minute. Returns count scheduled.
+def schedule_for(
+    event: Event, bot: Any, scheduler: AsyncIOScheduler
+) -> tuple[int, int | None]:
+    """Schedule reminder jobs for an event.
 
-    Skips: negative leads, past fire times.
-    Uses ``replace_existing=True`` so calling this twice for the same
-    event safely overwrites instead of duplicating.
+    Returns ``(scheduled_count, catch_up_lead)``. ``catch_up_lead`` is the
+    lead the caller should dispatch immediately so a reminder missed during
+    downtime (laptop sleep, scheduler stall beyond ``misfire_grace_time``,
+    Discord disconnect) still reaches the user. It is set only when no
+    future reminder will fire for this event AND the event itself is still
+    relevant (start is within ``PAST_EVENT_SLACK`` of now).
     """
     now = datetime.now(tz=config.TZ)
     scheduled = 0
+    catch_up: int | None = None
+
     for lead_min in event.remind_before:
         if lead_min < 0:
             continue
         fire_time = event.start - timedelta(minutes=lead_min)
-        if fire_time <= now:
-            # Past — would either fire immediately or miss entirely.
+        if fire_time > now:
+            scheduler.add_job(
+                send_reminder,
+                trigger=DateTrigger(run_date=fire_time, timezone=config.TIMEZONE),
+                args=[event.id, lead_min, bot],
+                id=_job_id(event.id, lead_min),
+                name=f"reminder for {event.title[:40]} (-{lead_min}m)",
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
+            scheduled += 1
             continue
-        scheduler.add_job(
-            send_reminder,
-            trigger=DateTrigger(run_date=fire_time, timezone=config.TIMEZONE),
-            args=[event.id, lead_min, bot],
-            id=_job_id(event.id, lead_min),
-            name=f"reminder for {event.title[:40]} (-{lead_min}m)",
-            replace_existing=True,
-            misfire_grace_time=60,
-        )
-        scheduled += 1
-    return scheduled
+
+        # Past fire time. Treat as a catch-up candidate only while the event
+        # itself is still upcoming (or just barely past).
+        if event.start + PAST_EVENT_SLACK < now:
+            continue
+        try:
+            if db.was_reminded(event.id, lead_min):
+                continue
+        except Exception:
+            logger.exception(
+                "[reminders] was_reminded check failed for %s/%dm", event.id, lead_min
+            )
+        # Smallest past lead = closest to the event = most useful message.
+        if catch_up is None or lead_min < catch_up:
+            catch_up = lead_min
+
+    if scheduled > 0:
+        # A normal future reminder will fire — don't pile on a catch-up DM.
+        catch_up = None
+    return scheduled, catch_up
 
 
 async def reschedule_all(bot: Any, scheduler: AsyncIOScheduler) -> dict[str, int]:
     """Wipe every reminder job and rebuild from current DB state.
 
-    Call after every sync and on boot. Cheap (in-memory job store).
-    Returns ``{"removed": n, "scheduled": m, "events": k}`` for logging.
+    Call after every sync, on boot, and on Discord reconnect. Also fires
+    immediate catch-up reminders for events whose normal DateTrigger fire
+    was missed during downtime but whose start time is still upcoming —
+    ``send_reminder`` is idempotent via the ``reminders_sent`` table, so
+    overlapping reschedule calls won't double-DM.
     """
     # 1. Wipe existing reminder jobs.
     removed = 0
@@ -111,23 +140,39 @@ async def reschedule_all(bot: Any, scheduler: AsyncIOScheduler) -> dict[str, int
             # Job just fired or was removed concurrently; that's fine.
             pass
 
-    # 2. Pull upcoming events from DB.
+    # 2. Pull candidate events. Look slightly backward so events that just
+    # started can still produce a catch-up DM.
     now = datetime.now(tz=config.TZ)
     horizon = now + timedelta(days=REMINDER_LOOKAHEAD_DAYS)
-    events = db.list_events(start=now, end=horizon)
+    events = db.list_events(start=now - PAST_EVENT_SLACK, end=horizon)
 
-    # 3. Schedule reminders for each.
+    # 3. Schedule reminders + collect catch-ups.
     scheduled = 0
+    catch_ups: list[tuple[str, int]] = []
     for event in events:
-        scheduled += schedule_for(event, bot, scheduler)
+        n, catch_up_lead = schedule_for(event, bot, scheduler)
+        scheduled += n
+        if catch_up_lead is not None:
+            catch_ups.append((event.id, catch_up_lead))
+
+    # 4. Dispatch catch-ups in the background — don't block reschedule_all
+    # on Discord network calls.
+    for event_id, lead_min in catch_ups:
+        asyncio.create_task(send_reminder(event_id, lead_min, bot))
 
     logger.info(
-        "[reminders] reschedule_all: removed=%d, scheduled=%d (from %d upcoming events)",
+        "[reminders] reschedule_all: removed=%d, scheduled=%d, catch_up=%d (from %d events)",
         removed,
         scheduled,
+        len(catch_ups),
         len(events),
     )
-    return {"removed": removed, "scheduled": scheduled, "events": len(events)}
+    return {
+        "removed": removed,
+        "scheduled": scheduled,
+        "catch_up": len(catch_ups),
+        "events": len(events),
+    }
 
 
 async def send_reminder(event_id: str, lead_min: int, bot: Any) -> None:
@@ -320,7 +365,10 @@ def _build_daily_summary_embed(today: date, events: list[Event]) -> discord.Embe
 
 def _build_reminder_embed(event: Event, lead_min: int, now: datetime) -> discord.Embed:
     icon = _TYPE_ICONS.get(event.type, "•")
-    when_label = _humanize_lead(lead_min)
+    # Use actual remaining time so a catch-up reminder fired after its
+    # original lead window still says e.g. "in 4 min" instead of "in 30 min".
+    actual_remaining = max(0, int(round((event.start - now).total_seconds() / 60)))
+    when_label = _humanize_lead(actual_remaining)
     title = discord.utils.escape_markdown(event.title)
 
     embed = discord.Embed(

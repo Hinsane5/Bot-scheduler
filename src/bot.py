@@ -743,6 +743,9 @@ class TimetableBot(discord.Client):
         intents.dm_messages = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        # Gate so initial on_ready (during boot) doesn't double-trigger the
+        # reminder reschedule that _initial_reminder_setup already runs.
+        self._first_ready = True
         self._register_commands()
 
     def _register_commands(self) -> None:
@@ -934,6 +937,25 @@ class TimetableBot(discord.Client):
             logger.info("Logged in as %s (id=%s)", user, user.id)
         else:
             logger.info("Logged in.")
+        if self._first_ready:
+            self._first_ready = False
+            return
+        await self._reschedule_after_reconnect("on_ready")
+
+    async def on_resumed(self) -> None:
+        """Discord WebSocket resumed after a disconnect — recover any
+        reminders that should have fired while we were away."""
+        await self._reschedule_after_reconnect("on_resumed")
+
+    async def _reschedule_after_reconnect(self, source: str) -> None:
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None:
+            return
+        logger.info("Discord %s; rebuilding reminder schedule", source)
+        try:
+            await reminders.reschedule_all(self, scheduler)
+        except Exception:
+            logger.exception("[%s] reminder reschedule failed", source)
 
 
 def create_bot() -> TimetableBot:
