@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from src import config, jobs, reminders
+from src import auth, config, jobs, reminders
 from src.bot import create_bot
 
 
@@ -164,7 +164,69 @@ async def _initial_reminder_setup(bot, scheduler) -> None:
     await reminders.reschedule_all(bot, scheduler)
 
 
+async def ensure_sessions() -> None:
+    """Pre-flight: for each enabled portal, validate session; if expired,
+    try a headless refresh, then fall back to interactive login.
+
+    If stdin is not a TTY (systemd service, background launch), interactive
+    login is skipped — the bot still starts and the sync_job will DM the
+    user on the next run telling them re-auth is needed.
+    """
+    interactive = sys.stdin.isatty()
+    for portal in config.ENABLED_SCRAPERS:
+        try:
+            auth.load_creds(portal)
+        except auth.AuthError:
+            # No saved creds yet — first-time setup.
+            if interactive:
+                log.info("[startup] no saved creds for %s; launching interactive login", portal)
+                try:
+                    await auth.interactive_login(portal)
+                    log.info("[startup] %s login complete", portal)
+                except auth.AuthError as exc:
+                    log.warning("[startup] %s interactive login failed: %s", portal, exc)
+            else:
+                log.warning(
+                    "[startup] no saved creds for %s and no TTY; run "
+                    "`python -m src.auth --portal=%s` then restart",
+                    portal, portal,
+                )
+            continue
+
+        if auth.is_session_valid(portal):
+            log.info("[startup] %s session valid", portal)
+            continue
+
+        log.info("[startup] %s session invalid; attempting headless refresh", portal)
+        try:
+            refreshed = await auth.refresh(portal)
+        except Exception:
+            log.exception("[startup] %s refresh raised", portal)
+            refreshed = False
+
+        if refreshed:
+            log.info("[startup] %s refresh succeeded", portal)
+            continue
+
+        if interactive:
+            log.warning("[startup] %s refresh failed; launching interactive login", portal)
+            try:
+                await auth.interactive_login(portal)
+                log.info("[startup] %s interactive login complete", portal)
+            except auth.AuthError as exc:
+                log.warning("[startup] %s interactive login failed: %s", portal, exc)
+        else:
+            log.warning(
+                "[startup] %s session expired and no TTY; bot will start "
+                "but sync will fail until you run "
+                "`python -m src.auth --portal=%s`",
+                portal, portal,
+            )
+
+
 async def amain() -> None:
+    await ensure_sessions()
+
     bot = create_bot()
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
     bot.scheduler = scheduler  # attached for future /status use

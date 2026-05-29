@@ -9,6 +9,7 @@ from typing import Iterable
 
 import discord
 from discord import app_commands
+from discord.app_commands import AppCommandContext, AppInstallationType
 
 from src import config, db, reminders
 from src.parser import Event
@@ -566,8 +567,10 @@ def get_list_events(
     if now is None:
         now = datetime.now(tz=config.TZ)
     end_dt = now + timedelta(days=days_window) if days_window is not None else None
+    # Filter by end time, not start — an event that began but hasn't ended
+    # should still appear in the schedule list.
     return db.list_events(
-        start=now,
+        end_after=now,
         end=end_dt,
         type=event_type,
         limit=LIST_MAX_EVENTS,
@@ -742,7 +745,15 @@ class TimetableBot(discord.Client):
         intents = discord.Intents.default()
         intents.dm_messages = True
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        # Tree-wide defaults so every command is usable in DMs and the bot
+        # can optionally be installed as a user app.
+        self.tree = app_commands.CommandTree(
+            self,
+            allowed_contexts=AppCommandContext(
+                guild=True, dm_channel=True, private_channel=True
+            ),
+            allowed_installs=AppInstallationType(guild=True, user=True),
+        )
         # Gate so initial on_ready (during boot) doesn't double-trigger the
         # reminder reschedule that _initial_reminder_setup already runs.
         self._first_ready = True
@@ -904,32 +915,40 @@ class TimetableBot(discord.Client):
                     )
 
     async def setup_hook(self) -> None:
-        """Sync slash commands once at startup."""
+        """Sync slash commands once at startup.
+
+        We always sync globally so commands appear in DMs (guild-only
+        commands can't be used outside that guild). When ``DISCORD_GUILD_ID``
+        is set we additionally sync to that guild for instant updates while
+        the global copy propagates (~1h on Discord's side).
+        """
         if config.DISCORD_GUILD_ID:
             try:
                 guild_id = int(config.DISCORD_GUILD_ID)
             except ValueError:
                 logger.warning(
-                    "DISCORD_GUILD_ID=%r is not an integer; falling back to global sync",
+                    "DISCORD_GUILD_ID=%r is not an integer; using global sync only",
                     config.DISCORD_GUILD_ID,
                 )
-                synced = await self.tree.sync()
-                logger.info("Synced %d slash command(s) globally", len(synced))
-                return
+                guild_id = None
+        else:
+            guild_id = None
+
+        if guild_id is not None:
             guild = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
+            guild_synced = await self.tree.sync(guild=guild)
             logger.info(
                 "Synced %d slash command(s) to guild %s (instant)",
-                len(synced),
+                len(guild_synced),
                 guild_id,
             )
-        else:
-            synced = await self.tree.sync()
-            logger.info(
-                "Synced %d slash command(s) globally (~1h propagation)",
-                len(synced),
-            )
+
+        global_synced = await self.tree.sync()
+        logger.info(
+            "Synced %d slash command(s) globally — DM-capable (~1h propagation)",
+            len(global_synced),
+        )
 
     async def on_ready(self) -> None:
         user = self.user

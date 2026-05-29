@@ -176,6 +176,7 @@ def list_events(
     start: datetime | date | None = None,
     end: datetime | date | None = None,
     *,
+    end_after: datetime | None = None,
     type: str | None = None,
     source: str | None = None,
     limit: int | None = None,
@@ -191,6 +192,12 @@ def list_events(
     if end is not None:
         clauses.append("start <= ?")
         params.append(_bound_to_text(end, is_end=True))
+    if end_after is not None:
+        # Keep events that haven't ended yet. Single-point events (no end
+        # column) fall back to start time.
+        bound = _bound_to_text(end_after, is_end=False)
+        clauses.append("(end >= ? OR (end IS NULL AND start >= ?))")
+        params.extend([bound, bound])
     if type is not None:
         clauses.append("type = ?")
         params.append(type)
