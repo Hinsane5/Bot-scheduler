@@ -320,6 +320,89 @@ class EditEventModal(discord.ui.Modal):
         return location, link, notes
 
 
+class AddEventModal(discord.ui.Modal):
+    """Form for /add — mirrors EditEventModal but for a brand-new event.
+
+    Discord has no native calendar/date picker, so the Start/End fields are
+    plain text inputs in ``YYYY-MM-DD HH:MM`` format. Start is pre-filled with
+    the next round hour so the user usually only has to tweak it, and Reminder
+    minutes default to the type's standard ramp (2h, 1h, 30m, 10m).
+    """
+
+    def __init__(self, type_value: str) -> None:
+        super().__init__(title="Add manual event")
+        self.type_value = type_value
+
+        now = datetime.now(tz=config.TZ)
+        default_start = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        default_reminders = config.DEFAULT_REMINDERS_BY_TYPE.get(type_value, [10])
+
+        self.title_input = discord.ui.TextInput(
+            label="Title",
+            placeholder="e.g. Project sync with John",
+            max_length=200,
+        )
+        self.start_input = discord.ui.TextInput(
+            label="Start (YYYY-MM-DD HH:MM)",
+            default=default_start.strftime("%Y-%m-%d %H:%M"),
+            max_length=16,
+        )
+        self.end_input = discord.ui.TextInput(
+            label="End (YYYY-MM-DD HH:MM, optional)",
+            required=False,
+            max_length=16,
+        )
+        self.details_input = discord.ui.TextInput(
+            label="Location/link/notes",
+            placeholder="location: Room 301\nlink: https://...\nnotes: bring laptop",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=600,
+        )
+        self.reminders_input = discord.ui.TextInput(
+            label="Reminder minutes",
+            default=",".join(str(m) for m in default_reminders),
+            required=False,
+            max_length=80,
+        )
+
+        self.add_item(self.title_input)
+        self.add_item(self.start_input)
+        self.add_item(self.end_input)
+        self.add_item(self.details_input)
+        self.add_item(self.reminders_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            location, link, notes = EditEventModal._unpack_optional_fields(str(self.details_input.value))
+            event = build_manual_event(
+                type_value=self.type_value,
+                title=str(self.title_input.value),
+                start_text=str(self.start_input.value),
+                end_text=str(self.end_input.value),
+                location=location,
+                link=link,
+                notes=notes,
+                remind_before=str(self.reminders_input.value),
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
+
+        inserted, updated = db.upsert_events([event])
+        await schedule_manual_event(event, interaction)
+        if inserted:
+            embed_title = "Saved manual event"
+        elif updated:
+            embed_title = "Updated existing manual event"
+        else:
+            embed_title = "Manual event already exists"
+        await interaction.response.send_message(
+            embed=_event_to_embed(event, embed_title),
+            ephemeral=True,
+        )
+
+
 # --- embed builders ---------------------------------------------------------
 
 def build_today_embed(now: datetime | None = None) -> discord.Embed:
@@ -801,56 +884,14 @@ class TimetableBot(discord.Client):
         async def list_schedule_cmd(interaction: discord.Interaction) -> None:
             await send_schedule_list(interaction)
 
-        @self.tree.command(name="add", description="Add a manual meeting or other event")
-        @app_commands.describe(
-            type="Manual event type",
-            title="Event title",
-            start="Start time in YYYY-MM-DD HH:MM",
-            end="Optional end time in YYYY-MM-DD HH:MM",
-            location="Optional location",
-            link="Optional URL",
-            remind_before="Optional comma-separated reminder minutes, e.g. 10 or 1440,60",
-            notes="Optional notes",
-        )
+        @self.tree.command(name="add", description="Add a manual meeting or other event (opens a form)")
+        @app_commands.describe(type="Manual event type — the rest is filled in on the form")
         @app_commands.choices(type=MANUAL_TYPE_CHOICES)
         async def add_cmd(
             interaction: discord.Interaction,
             type: app_commands.Choice[str],
-            title: str,
-            start: str,
-            end: str | None = None,
-            location: str | None = None,
-            link: str | None = None,
-            remind_before: str | None = None,
-            notes: str | None = None,
         ) -> None:
-            try:
-                event = build_manual_event(
-                    type_value=type.value,
-                    title=title,
-                    start_text=start,
-                    end_text=end,
-                    location=location,
-                    link=link,
-                    notes=notes,
-                    remind_before=remind_before,
-                )
-            except ValueError as exc:
-                await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
-                return
-
-            inserted, updated = db.upsert_events([event])
-            await schedule_manual_event(event, interaction)
-            if inserted:
-                embed_title = "Saved manual event"
-            elif updated:
-                embed_title = "Updated existing manual event"
-            else:
-                embed_title = "Manual event already exists"
-            await interaction.response.send_message(
-                embed=_event_to_embed(event, embed_title),
-                ephemeral=True,
-            )
+            await interaction.response.send_modal(AddEventModal(type.value))
 
         @self.tree.command(name="delete", description="Delete a manually-added event")
         @app_commands.describe(id="Manual event ID or unique ID prefix")

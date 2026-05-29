@@ -45,8 +45,8 @@ DEFAULT_REMINDERS_BY_TYPE = {
     "teaching": [120, 60, 30, 10],
     "assignment_deadline": [120, 60, 30, 10],
     "correction_deadline": [120, 60, 30, 10],
-    # Personal events default to a single 10-min nudge — user can override
-    # per-event via /add remind_before:....
-    "meeting": [10],
-    "other": [10],
+    # Manual / personal events get the same four-step ramp as academic
+    # events — user can still override per-event in the /add or /edit form.
+    "meeting": [120, 60, 30, 10],
+    "other": [120, 60, 30, 10],
 }
